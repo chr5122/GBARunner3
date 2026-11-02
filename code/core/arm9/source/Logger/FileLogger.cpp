@@ -3,6 +3,7 @@
 #include "mini-printf.h"
 #include "Cpsr.h"
 #include "FileLogger.h"
+#include "PerfScreen.h"
 
 [[gnu::section(".ewram")]]
 bool FileLogger::Open(const char* path)
@@ -31,14 +32,18 @@ void FileLogger::LogV(LogLevel level, const char* fmt, va_list vlist)
         return;
 
     u32 irqs = arm_disableIrqs();
+    u32 perfScope = perfScreenEnterScope(1);
     {
         mini_vsnprintf(_logBuffer, sizeof(_logBuffer), fmt, vlist);
         UINT bw;
+        perfScreenLog();
         if (f_write(_file, _logBuffer, strlen(_logBuffer), &bw) == FR_OK)
         {
             // Keep the log observable even after a power loss / crash.
+            perfScreenSync();
             f_sync(_file);
         }
     }
+    perfScreenLeaveScope(perfScope);
     arm_restoreIrqs(irqs);
 }

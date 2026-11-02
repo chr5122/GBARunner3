@@ -1,5 +1,7 @@
 #include "common.h"
 #include "Slot2Diag.h"
+#include "PerfScreen.h"
+#include "X1Readonly.h"
 
 // Runtime ROM-load diagnostics (full diagnostic build).
 //
@@ -43,6 +45,7 @@ static bool sDiagFlushing;
 extern "C" [[gnu::section(".ewram")]]
 void slot2DiagTrace(u32 romBlock, u8 source, u8 state)
 {
+    perfScreenLoad(romBlock, source, state);
     Slot2DiagEntry* e = &sDiagRing[sDiagRingHead % SLOT2DIAG_RING_SIZE];
     e->romBlock = romBlock;
     e->source = source;
@@ -57,6 +60,7 @@ void slot2DiagTrace(u32 romBlock, u8 source, u8 state)
 extern "C" [[gnu::section(".ewram")]]
 void slot2DiagVblankHook(void)
 {
+    if (!x1HeartbeatEnabled()) return; // X1: no tick logging or keepalive I/O
     sDiagIrqCount++;
     if ((sDiagIrqCount % SLOT2DIAG_FLUSH_INTERVAL) != 0)
         return;

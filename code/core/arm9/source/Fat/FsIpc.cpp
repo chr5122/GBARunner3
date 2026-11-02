@@ -9,11 +9,16 @@
 #include "Cpsr.h"
 #include "VirtualMachine/VMNestedIrq.h"
 #include "FsIpc.h"
+#include "PerfScreen.h"
+#include "X1Readonly.h"
 
 [[gnu::section(".ewram.bss")]]
 alignas(32) static fs_ipc_cmd_t sIpcCommand;
 [[gnu::section(".ewram.bss")]]
 alignas(32) static u8 sTempBuffers[2][512];
+
+[[gnu::section(".ewram.bss")]]
+static u32 sReadTempInUse;
 
 static FsWaitToken* volatile sCurrentWaitToken = nullptr;
 
@@ -23,11 +28,24 @@ static bool isArm7FsOperationComplete()
     return ((ipcSync >> IPCSYNC_LOCAL_DATA_SHIFT) & 0xF) == (ipcSync & IPCSYNC_REMOTE_DATA_MASK);
 }
 
+// Called with IRQs disabled. ARM7 writes the result before acknowledging;
+// the command is immutable while pending, so this clean line may be dropped.
+[[gnu::section(".ewram"), gnu::noinline]]
+static void completeWaitToken(FsWaitToken* token)
+{
+    dc_invalidateRange(&sIpcCommand, sizeof(sIpcCommand));
+    token->readResult = sIpcCommand.readResult == FS_READ_OK ? FS_READ_OK : FS_READ_FAILED;
+    token->transactionComplete = true;
+    sCurrentWaitToken = nullptr;
+}
+
 extern "C"
 [[gnu::noinline]]
 u32 fs_waitForCompletion(FsWaitToken* waitToken, bool keepIrqsDisabled)
 {
     u32 irqs;
+    u32 diagPolls = 0;
+    perfScreenWaitBegin();
 #ifdef GBAR3_IRQ_YIELDING
     if (gIrqYieldingEnabled)
     {
@@ -46,8 +64,7 @@ u32 fs_waitForCompletion(FsWaitToken* waitToken, bool keepIrqsDisabled)
             }
             else if (isArm7FsOperationComplete())
             {
-                currentWaitToken->transactionComplete = true;
-                sCurrentWaitToken = nullptr;
+                completeWaitToken(currentWaitToken);
                 break;
             }
             if (!(irqs & 0x80) && !vm_yieldGbaIrqs())
@@ -75,14 +92,15 @@ u32 fs_waitForCompletion(FsWaitToken* waitToken, bool keepIrqsDisabled)
             }
             else if (isArm7FsOperationComplete())
             {
-                currentWaitToken->transactionComplete = true;
-                sCurrentWaitToken = nullptr;
+                completeWaitToken(currentWaitToken);
                 break;
             }
+            ++diagPolls;
             arm_restoreIrqs(irqs);
         }
     }
 
+    perfScreenWait(diagPolls);
     if (!keepIrqsDisabled)
     {
         arm_restoreIrqs(irqs);
@@ -98,6 +116,14 @@ extern "C" u32 fs_waitForCompletionOfCurrentTransaction(bool keepIrqsDisabled)
 
 static void sendIpcCommand()
 {
+    sIpcCommand.readResult =
+        sIpcCommand.cmd == FS_IPC_CMD_DLDI_READ_SECTORS || sIpcCommand.cmd == FS_IPC_CMD_DSI_SD_READ_SECTORS
+        ? FS_READ_PENDING : FS_READ_OK; // Write semantics stay unchanged in R1.
+    if (sIpcCommand.cmd==FS_IPC_CMD_DLDI_WRITE_SECTORS || sIpcCommand.cmd==FS_IPC_CMD_DSI_SD_WRITE_SECTORS)
+        if (!d2BootWritesAllowed()) x1BlockedWrite();
+    if (sIpcCommand.cmd==FS_IPC_CMD_DLDI_READ_SECTORS || sIpcCommand.cmd==FS_IPC_CMD_DSI_SD_READ_SECTORS)
+        x1CountRead();
+    perfScreenRequest(sIpcCommand.cmd, sIpcCommand.sector, sIpcCommand.count);
     dc_flushRange(&sIpcCommand, sizeof(sIpcCommand));
     ipc_setArm9SyncBits(ipc_getArm7SyncBits() + 1);
     ipc_sendWordDirect(((((u32)&sIpcCommand) >> 2) << IPC_FIFO_MSG_CHANNEL_BITS) | IPC_CHANNEL_FS);
@@ -105,6 +131,7 @@ static void sendIpcCommand()
 
 static void executeIpcCommandAsync(u32 cmd, void* buffer, u32 sector, u32 count, FsWaitToken* waitToken)
 {
+    waitToken->readResult = FS_READ_PENDING;
     waitToken->transactionComplete = false;
     u32 irqs = fs_waitForCompletion(nullptr, true);
     {
@@ -126,40 +153,51 @@ extern "C" void fs_readCacheAlignedSectorsAsync(FsDevice device, void* buffer, u
         buffer, sector, count, waitToken);
 }
 
-static void readSectorsNotCacheAligned(FsDevice device, void* buffer, u32 sector, u32 count)
+[[gnu::section(".ewram"), gnu::noinline]]
+static bool readSectorsNotCacheAligned(FsDevice device, void* buffer, u32 sector, u32 count)
 {
-    sIpcCommand.cmd = device == FS_DEVICE_DLDI ? FS_IPC_CMD_DLDI_READ_SECTORS : FS_IPC_CMD_DSI_SD_READ_SECTORS;
-    sIpcCommand.count = 1;
-    // not cache aligned, use a temp buffer
-    dc_invalidateRange(sTempBuffers[0], 512);
+    // Reuse the existing buffers, with a lease across each asynchronous wait.
+    // Nested callers can use the other buffer, never overwrite pending data.
+    u32 irqs = arm_disableIrqs();
+    u32 slot = !(sReadTempInUse & 1) ? 0 : !(sReadTempInUse & 2) ? 1 : 2;
+    if (slot == 2) {
+        arm_restoreIrqs(irqs);
+        return false;
+    }
+    sReadTempInUse |= 1u << slot;
+    arm_restoreIrqs(irqs);
+    bool ok = true;
     for (u32 i = 0; i < count; i++)
     {
-        sIpcCommand.buffer = sTempBuffers[i & 1];
-        sIpcCommand.sector = sector + i;
-        sendIpcCommand();
-        if (i != 0)
-            memcpy((u8*)buffer + 512 * (i - 1), sTempBuffers[(i - 1) & 1], 512);
-        if (i != count - 1)
-            dc_invalidateRange(sTempBuffers[(i + 1) & 1], 512);
-        while (!isArm7FsOperationComplete());
+        FsWaitToken token;
+        fs_readCacheAlignedSectorsAsync(device, sTempBuffers[slot], sector + i, 1, &token);
+        irqs = fs_waitForCompletion(&token, true);
+        ok = token.readResult == FS_READ_OK;
+        if (ok) memcpy((u8*)buffer + 512 * i, sTempBuffers[slot], 512);
+        arm_restoreIrqs(irqs);
+        if (!ok) break;
     }
-    memcpy((u8*)buffer + 512 * (count - 1), sTempBuffers[(count - 1) & 1], 512);
+    irqs = arm_disableIrqs();
+    sReadTempInUse &= ~(1u << slot);
+    arm_restoreIrqs(irqs);
+    return ok;
 }
 
-extern "C" void fs_readSectors(FsDevice device, void* buffer, u32 sector, u32 count)
+extern "C" bool fs_readSectors(FsDevice device, void* buffer, u32 sector, u32 count)
 {
     if (count == 0)
-        return;
+        return true;
 
     if (((u32)buffer >> 24) != 2 || ((u32)buffer & 0x1F))
     {
-        readSectorsNotCacheAligned(device, buffer, sector, count);
+        return readSectorsNotCacheAligned(device, buffer, sector, count);
     }
     else
     {
         FsWaitToken waitToken;
         fs_readCacheAlignedSectorsAsync(device, buffer, sector, count, &waitToken);
         fs_waitForCompletion(&waitToken, false);
+        return waitToken.readResult == FS_READ_OK;
     }
 }
 

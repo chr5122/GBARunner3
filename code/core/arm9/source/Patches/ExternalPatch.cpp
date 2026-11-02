@@ -9,6 +9,7 @@
 #include "SdCache/SdCache.h"
 #include "MemCopy.h"
 #include "ExternalPatch.h"
+#include "X1Readonly.h"
 #include "cp15.h"
 
 extern FIL gExternalPatchFile;
@@ -244,15 +245,19 @@ u32 ExternalPatch::ComputeRomSourceHash()
 }
 
 [[gnu::section(".ewram")]]
-bool ExternalPatch::TryLoadPrepatch(u32 patchHash)
+bool ExternalPatch::TryLoadPrepatch(u32 patchHash, const char* pathOverride)
 {
     if (mIndexCount == 0)
         return false;
 
-    char prePath[64];
-    getPrepatchPath(prePath, sizeof(prePath), mHeader.gamecode, mHeader.version);
+    // Boot-only validation scratch; cache fetches have not begun yet.
+    struct ValidationScratch { char path[64]; PrepatchHeader header; PrepatchBlockEntry entry; };
+    static_assert(sizeof(ValidationScratch) <= SDC_BLOCK_SIZE);
+    auto& scratch = *reinterpret_cast<ValidationScratch*>(&sdc_cache[3][0]);
+    char* prePath = scratch.path;
+    getPrepatchPath(prePath, 64, mHeader.gamecode, mHeader.version);
 
-    if (f_open(&gPrepatchFile, prePath, FA_READ | FA_OPEN_EXISTING) != FR_OK)
+    if (f_open(&gPrepatchFile, pathOverride ? pathOverride : prePath, FA_READ | FA_OPEN_EXISTING) != FR_OK)
         return false;
 
     auto reject = [&]() -> bool {
@@ -261,7 +266,7 @@ bool ExternalPatch::TryLoadPrepatch(u32 patchHash)
     };
 
     UINT br;
-    PrepatchHeader header;
+    PrepatchHeader& header = scratch.header;
     if (f_read(&gPrepatchFile, &header, sizeof(header), &br) != FR_OK || br != sizeof(header))
         return reject();
     if (header.valid != 1 || header.formatVersion != PREPATCH_FORMAT_VERSION)
@@ -288,7 +293,7 @@ bool ExternalPatch::TryLoadPrepatch(u32 patchHash)
     // Entries must match the in-memory index exactly (order, ids, offsets).
     for (u32 i = 0; i < mIndexCount; i++)
     {
-        PrepatchBlockEntry entry;
+        PrepatchBlockEntry& entry = scratch.entry;
         if (f_read(&gPrepatchFile, &entry, sizeof(entry), &br) != FR_OK || br != sizeof(entry))
             return reject();
         if (entry.blockIndex != sBlockIndex[i].block_index
@@ -309,147 +314,120 @@ bool ExternalPatch::TryLoadPrepatch(u32 patchHash)
     return true;
 }
 
-[[gnu::section(".ewram")]]
+// D2: boot-only baker. Never truncate/delete an existing sidecar.
+// Uses already-owned SD-cache blocks 0/1/2 before any cache fetches.
+[[gnu::section(".ewram"), gnu::noinline]]
 bool ExternalPatch::BakePrepatch(u32 patchHash)
 {
-    // TryLoad guarantees the patch is loaded before calling this. The
-    // mLoaded flag is intentionally NOT checked: a corrupted flag must not
-    // hide the real bake failure behind a silent early return.
-    if (mIndexCount == 0)
-    {
-        return true;
-    }
-
-    char prePath[64];
-    getPrepatchPath(prePath, sizeof(prePath), mHeader.gamecode, mHeader.version);
-
-    FRESULT openRes = f_open(&gPrepatchFile, prePath, FA_READ | FA_WRITE | FA_CREATE_ALWAYS);
-    if (openRes != FR_OK)
-    {
-        gLogger->Log(LogLevel::Error, "External patch: cannot create %s (res=%d)\n", prePath, (int)openRes);
-        return false;
-    }
-
-    auto abortBake = [&](u32 step) -> bool {
-        gLogger->Log(LogLevel::Error, "External patch: bake aborted at step %u\n", step);
-        f_sync(&gPrepatchFile);
-        f_close(&gPrepatchFile);
-        f_unlink(prePath);
-        sPrepatchTableValid = false;
-        return false;
+    struct BootScratch {
+        char pre[64], temp[64], backup[64];
+        FILINFO info;
+        PrepatchHeader header;
     };
-
-    u32 clusterSize = gFile.obj.fs->csize * 512;
+    static_assert(sizeof(BootScratch) <= SDC_BLOCK_SIZE);
+    auto& scratch = *reinterpret_cast<BootScratch*>(&sdc_cache[2][0]);
+    char* prePath = scratch.pre;
+    char* tempPath = scratch.temp;
+    char* backupPath = scratch.backup;
+    FILINFO& info = scratch.info;
+    getPrepatchPath(prePath, 64, mHeader.gamecode, mHeader.version);
+    memcpy(tempPath, prePath, 64);
+    memcpy(backupPath, prePath, 64);
+    u32 pathLength = strlen(prePath);
+    memcpy(tempPath + pathLength - 3, "tmp", 4);
+    memcpy(backupPath + pathLength - 3, "bak", 4);
+    FRESULT res = f_stat(prePath, &info);
+    bool hadOld = res == FR_OK;
+    if ((hadOld && (info.fattrib & AM_DIR)) ||
+        (!hadOld && res != FR_NO_FILE && res != FR_NO_PATH)) x1Stop(31);
+    res = f_stat(tempPath, &info);
+    if (res != FR_NO_FILE && res != FR_NO_PATH) x1Stop(32);
+    if (hadOld) {
+        res = f_stat(backupPath, &info);
+        if (res != FR_NO_FILE && res != FR_NO_PATH) x1Stop(33);
+    }
+    FATFS* fs = gFile.obj.fs;
+    if (!fs || (fs->pdrv != DEV_FAT && fs->pdrv != DEV_SD) ||
+        !fs->csize || (fs->csize & (fs->csize - 1))) x1Stop(34);
+    u32 clusterSize = fs->csize * 512;
     u32 indexBytes = mIndexCount * sizeof(PrepatchBlockEntry);
     u32 dataBase = (sizeof(PrepatchHeader) + indexBytes + clusterSize - 1) & ~(clusterSize - 1);
-
-    PrepatchHeader header;
-    memset(&header, 0, sizeof(header));
-    header.valid = 0; // placeholder; promoted to 1 only after everything is written
+    PrepatchHeader& header = scratch.header;
+    header = {};
     header.formatVersion = PREPATCH_FORMAT_VERSION;
     header.patchHash = patchHash;
     header.patchedBlockCount = mIndexCount;
     header.romSize = mRomSize != 0 ? mRomSize : (u32)f_size(&gFile);
     header.romHash = ComputeRomSourceHash();
-    if (header.romHash == 0)
-    {
-        return abortBake(1);
-    }
+    if (!mIndexCount || !header.romHash) x1Stop(35);
 
+    d2BeginBootWrites();
+    bool opened = false;
+    auto fail = [&](u32 code) -> bool {
+        // Preserve temp/backup for inspection; never unlink on failure.
+        if (opened) f_close(&gPrepatchFile);
+        sPrepatchTableValid = false;
+        d2EndBootWrites();
+        x1Stop(code);
+    };
+    res = f_mkdir(GAME_PREPATCH_DIR_PATH);
+    if (res != FR_OK && res != FR_EXIST) return fail(36);
+    if (f_open(&gPrepatchFile, tempPath, FA_READ | FA_WRITE | FA_CREATE_NEW) != FR_OK) return fail(37);
+    opened = true;
     UINT bw;
-    if (f_write(&gPrepatchFile, &header, sizeof(header), &bw) != FR_OK || bw != sizeof(header))
-        return abortBake(1);
-
-    // Index entries, then padding up to the 512/cluster-aligned data base.
-    u32 pos = sizeof(PrepatchHeader);
-    for (u32 i = 0; i < mIndexCount; i++)
-    {
-        PrepatchBlockEntry entry;
-        entry.blockIndex = sBlockIndex[i].block_index;
-        entry.reserved = 0;
-        entry.dataOffset = dataBase + i * SDC_BLOCK_SIZE;
-        if (f_write(&gPrepatchFile, &entry, sizeof(entry), &bw) != FR_OK || bw != sizeof(entry))
-            return abortBake(2);
-        pos += sizeof(entry);
+    if (f_write(&gPrepatchFile, &header, sizeof(header), &bw) != FR_OK || bw != sizeof(header)) return fail(38);
+    for (u32 i=0; i<mIndexCount; ++i) {
+        PrepatchBlockEntry entry = {sBlockIndex[i].block_index, 0, dataBase + i * SDC_BLOCK_SIZE};
+        if (f_write(&gPrepatchFile, &entry, sizeof(entry), &bw) != FR_OK || bw != sizeof(entry)) return fail(38);
     }
-    if (pos < dataBase)
-    {
-        memset(BAKE_BUF, 0, SDC_BLOCK_SIZE);
-        u32 pad = dataBase - pos;
-        while (pad > 0)
-        {
-            u32 chunk = pad > SDC_BLOCK_SIZE ? SDC_BLOCK_SIZE : pad;
-            if (f_write(&gPrepatchFile, BAKE_BUF, chunk, &bw) != FR_OK || bw != chunk)
-                return abortBake(3);
-            pad -= chunk;
-        }
+    u32 pad = dataBase - sizeof(header) - indexBytes;
+    memset(BAKE_BUF, 0, SDC_BLOCK_SIZE);
+    while (pad) {
+        u32 n = pad > SDC_BLOCK_SIZE ? SDC_BLOCK_SIZE : pad;
+        if (f_write(&gPrepatchFile, BAKE_BUF, n, &bw) != FR_OK || bw != n) return fail(38);
+        pad -= n;
     }
-
-    // Bake every patched block: original block + IPS records -> 4KB result.
-    u32 expectedFirstDword = 0;
-    for (u32 i = 0; i < mIndexCount; i++)
-    {
-        const RomBlockIndexEntry& entry = sBlockIndex[i];
-        if (!ReadRomBlock(entry.block_index, BAKE_BUF))
-        {
-            gLogger->Log(LogLevel::Error, "External patch: bake read failed for block %u\n", entry.block_index);
-            return abortBake(4);
-        }
-        if (!ApplyIPSPatches(entry.block_patch_address, entry.block_patch_size, BAKE_BUF))
-        {
-            gLogger->Log(LogLevel::Error, "External patch: bake apply failed for block %u\n", entry.block_index);
-            return abortBake(5);
-        }
-        if (i == 0)
-        {
-            // Capture the FIRST baked block's head for the readback check;
-            // BAKE_BUF is reused and will hold the last block afterwards.
-            expectedFirstDword = *(u32*)BAKE_BUF;
-        }
-        if (f_write(&gPrepatchFile, BAKE_BUF, SDC_BLOCK_SIZE, &bw) != FR_OK || bw != SDC_BLOCK_SIZE)
-            return abortBake(6);
+    for (u32 i=0; i<mIndexCount; ++i) {
+        const auto& entry = sBlockIndex[i];
+        if (!ReadRomBlock(entry.block_index, BAKE_BUF) ||
+            !ApplyIPSPatches(entry.block_patch_address, entry.block_patch_size, BAKE_BUF)) return fail(39);
+        if (f_write(&gPrepatchFile, BAKE_BUF, SDC_BLOCK_SIZE, &bw) != FR_OK || bw != SDC_BLOCK_SIZE) return fail(38);
     }
-
-    // Commit: promote the placeholder to a valid cache.
+    // Flush the complete valid=0 payload before committing the temporary header.
+    if (f_sync(&gPrepatchFile) != FR_OK) return fail(40);
     header.valid = 1;
-    if (f_lseek(&gPrepatchFile, 0) != FR_OK)
-        return abortBake(7);
-    if (f_write(&gPrepatchFile, &header, sizeof(header), &bw) != FR_OK || bw != sizeof(header))
-        return abortBake(8);
+    if (f_lseek(&gPrepatchFile, 0) != FR_OK ||
+        f_write(&gPrepatchFile, &header, sizeof(header), &bw) != FR_OK || bw != sizeof(header) ||
+        f_sync(&gPrepatchFile) != FR_OK) return fail(40);
+    if (f_close(&gPrepatchFile) != FR_OK) return fail(41);
+    opened = false;
 
-    // Build the cluster map for runtime raw-sector reads.
-    sPrepatchClusterTable[0] = sizeof(sPrepatchClusterTable) / sizeof(DWORD);
-    gPrepatchFile.cltbl = sPrepatchClusterTable;
-    if (f_lseek(&gPrepatchFile, CREATE_LINKMAP) != FR_OK)
-        return abortBake(9);
-    if (f_sync(&gPrepatchFile) != FR_OK)
-        return abortBake(10);
-
-    sPrepatchFileSize = (u32)f_size(&gPrepatchFile);
-    sPrepatchTableValid = true;
-
-    gLogger->Log(LogLevel::Debug,
-        "External patch: baked %u blocks (clusterSize=%u) to %s\n",
-        mIndexCount, clusterSize, prePath);
-
-    // Self-check: read the first baked block back through the exact raw-sector
-    // path used at runtime. Catches cluster-map/geometry mistakes at boot
-    // instead of white-screening in-game.
-    u32 checkSector = externalPatch_getBakedBlockSector(sBlockIndex[0].block_index);
-    if (checkSector == 0)
-    {
-        gLogger->Log(LogLevel::Error, "External patch: readback sector lookup failed\n");
-        return abortBake(11);
+    // Reopen READ ONLY, validate the ordinary metadata/map, then compare EVERY
+    // raw-sector block to independently recomputed cart+patch contents.
+    if (!TryLoadPrepatch(patchHash, tempPath)) return fail(42);
+    opened = true;
+    u8* verify = &sdc_cache[1][0];
+    for (u32 i=0; i<mIndexCount; ++i) {
+        const auto& entry = sBlockIndex[i];
+        if (!ReadRomBlock(entry.block_index, BAKE_BUF) ||
+            !ApplyIPSPatches(entry.block_patch_address, entry.block_patch_size, BAKE_BUF)) return fail(43);
+        u32 sector = externalPatch_getBakedBlockSector(entry.block_index);
+        if (!sector) return fail(44);
+        for (u32 j=0; j<SDC_BLOCK_SIZE; ++j) verify[j] = BAKE_BUF[j] ^ 0xFF;
+        dc_flushRange(verify, SDC_BLOCK_SIZE);
+        dc_drainWriteBuffer(); // preserve poison across the read-side invalidate
+        if (!fs_readSectors(fs->pdrv == DEV_FAT ? FS_DEVICE_DLDI : FS_DEVICE_DSI_SD,
+                       verify, sector, SDC_BLOCK_SIZE / 512)) return fail(45);
+        if (memcmp(BAKE_BUF, verify, SDC_BLOCK_SIZE)) return fail(45);
     }
-    fs_readSectors(gFile.obj.fs->pdrv == DEV_FAT ? FS_DEVICE_DLDI : FS_DEVICE_DSI_SD,
-                   BAKE_BUF, checkSector, SDC_BLOCK_SIZE / 512);
-    if (memcmp(BAKE_BUF, &expectedFirstDword, 4) != 0)
-    {
-        gLogger->Log(LogLevel::Error,
-            "External patch: readback mismatch (expected 0x%08X, got 0x%08X)\n",
-            expectedFirstDword, *(u32*)BAKE_BUF);
-        return abortBake(12);
-    }
+    if (f_close(&gPrepatchFile) != FR_OK) return fail(41);
+    opened = false;
+    sPrepatchTableValid = false;
+    // FAT rename is NOT a power-loss-atomic multi-file transaction. Each result
+    // is checked; the old file is retained under .bak and never deleted here.
+    if (hadOld && f_rename(prePath, backupPath) != FR_OK) return fail(46);
+    if (f_rename(tempPath, prePath) != FR_OK) return fail(47);
+    d2EndBootWrites(); // drain outstanding I/O and permanently close the window
     return true;
 }
 
@@ -526,10 +504,7 @@ bool ExternalPatch::TryLoad(const GbaHeader& header)
 
     // Pre-patched cache: reuse a valid .pre, or bake a new one. The patch
     // hash recorded inside detects any change of the .patch file.
-    if (mIndexCount == 0)
-    {
-        return true;
-    }
+    if (mIndexCount == 0) x1Stop(X1_BAD_PATCH);
 
     u32 patchHash = computePatchFileHash();
     if (patchHash == 0)
@@ -540,20 +515,13 @@ bool ExternalPatch::TryLoad(const GbaHeader& header)
         return false;
     }
 
-    f_mkdir(GAME_PREPATCH_DIR_PATH); // ok if it already exists
-
-    if (TryLoadPrepatch(patchHash))
-    {
-        return true;
+    // D2: warm cache is read-only; cold cache writes only inside the baker.
+    if (!TryLoadPrepatch(patchHash)) {
+        if (!BakePrepatch(patchHash)) x1Stop(30);
+        // The window is closed before reopening the final name for runtime.
+        if (!TryLoadPrepatch(patchHash)) x1Stop(49);
     }
-
-    if (!BakePrepatch(patchHash))
-    {
-        // The .pre cache is an optimization, not a requirement: fall back to
-        // on-demand patching (linear at boot + per-cache-block at runtime).
-        gLogger->Log(LogLevel::Warning, "External patch: bake failed, falling back to on-demand patching\n");
-        return true;
-    }
+    x1PreVerified();
     return true;
 }
 

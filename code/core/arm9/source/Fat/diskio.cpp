@@ -7,6 +7,7 @@
 #include "cp15.h"
 #include "FsIpc.h"
 #include "diskio.h"
+#include "X1Readonly.h"
 
 static u32 sAgbMem;
 
@@ -40,13 +41,11 @@ extern "C" DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 {
     if (pdrv == DEV_FAT)
     {
-        fs_readSectors(FS_DEVICE_DLDI, buff, sector, count);
-        return RES_OK;
+        return fs_readSectors(FS_DEVICE_DLDI, buff, sector, count) ? RES_OK : RES_ERROR;
     }
     else if (pdrv == DEV_SD)
     {
-        fs_readSectors(FS_DEVICE_DSI_SD, buff, sector, count);
-        return RES_OK;
+        return fs_readSectors(FS_DEVICE_DSI_SD, buff, sector, count) ? RES_OK : RES_ERROR;
     }
     else if (pdrv == DEV_PC)
     {
@@ -71,6 +70,7 @@ extern "C" DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 
 extern "C" DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
+    if (!d2BootWritesAllowed() || (pdrv!=DEV_FAT && pdrv!=DEV_SD)) x1BlockedWrite(); // boot cache only
     if (pdrv == DEV_FAT)
     {
         fs_writeSectors(FS_DEVICE_DLDI, buff, sector, count);

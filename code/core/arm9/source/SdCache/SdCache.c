@@ -12,11 +12,18 @@
 #include "MemCopy.h"
 #include "Slot2.h"
 #include "Slot2Diag.h"
+#include "PerfScreen.h"
+#include "X1Readonly.h"
+#include "GbaDma.h"
+#include "Peripherals/DmaTransfer.h"
+#include "Emulator/IoRegisters.h"
+#include "VirtualMachine/VMDtcm.h"
 
 typedef struct
 {
     vu16 cacheBlock;
     vu32 romBlock;
+    FsWaitToken* volatile waitToken;
 } SdcFetch;
 
 // The default .bss (vrama) is full: these small statics live in EWRAM BSS.
@@ -108,12 +115,24 @@ static bool isCurrentlyFetching(void)
     return sCurrentFetch.cacheBlock != SDC_BLOCK_INVALID;
 }
 
+[[gnu::section(".ewram"), gnu::noinline]]
 static void finishFetch()
 {
+    // The token is owned by a still-live loadRomBlock stack frame. Nested
+    // IRQ completion must validate that transfer, not a later IPC command.
+    FsWaitToken* token = sCurrentFetch.waitToken;
+    if (!token || !token->transactionComplete || token->readResult != FS_READ_OK)
+    {
+        sCurrentFetch.romBlock = SDC_ROM_BLOCK_INVALID;
+        sCurrentFetch.cacheBlock = SDC_BLOCK_INVALID;
+        sCurrentFetch.waitToken = NULL;
+        x1Stop(X1_SD_READ_FAILED);
+    }
     sCacheBlockToRomBlock[sCurrentFetch.cacheBlock] = sCurrentFetch.romBlock;
     sdc_romBlockToCacheBlock[sCurrentFetch.romBlock] = &sdc_cache[sCurrentFetch.cacheBlock][0];
     sCurrentFetch.romBlock = SDC_ROM_BLOCK_INVALID;
     sCurrentFetch.cacheBlock = SDC_BLOCK_INVALID;
+    sCurrentFetch.waitToken = NULL;
     dc_drainWriteBuffer();
 }
 
@@ -167,6 +186,67 @@ static void fillOutOfBoundsCacheBlock(u32 romBlock, u32 cacheBlock)
     dc_drainWriteBuffer();
 }
 
+// H1: bounded maintenance while the ROM cache block remains unpublished.
+// No CPU IRQ unmasking, no nested game callbacks, no new persistent state.
+[[gnu::section(".ewram"), gnu::noinline]]
+static bool h1WindowDmaSafe(u32 flags, const GbaDmaChannel* io, u32 src, u32 dst)
+{
+    const u32 wanted = GBA_DMA_CONTROL_ENABLED | GBA_DMA_CONTROL_REPEAT |
+        (GBA_DMA_CONTROL_MODE_HBLANK << GBA_DMA_CONTROL_MODE_SHIFT) |
+        (GBA_DMA_CONTROL_DST_STEP_RELOAD << GBA_DMA_CONTROL_DST_STEP_SHIFT);
+    if ((flags & DMA_FLAG_HBLANK_MASK) != DMA_FLAG_HBLANK(0) ||
+        io->control != wanted || io->count != 1 ||
+        (io->dst != 0x04000040 && io->dst != 0x04000042) || dst != io->dst || (src & 1))
+        return false;
+    return (src >= 0x02000000 && src <= 0x0203FFFE) ||
+        (src >= 0x03000000 && src <= 0x03007FFE);
+}
+
+extern void dma_dmaTransfer(int channel);
+
+[[gnu::section(".ewram"), gnu::noinline]]
+static void h1PollWindowDma(void)
+{
+    const GbaDmaChannel* io = (const GbaDmaChannel*)&emu_ioRegisters[0xB0];
+    if (!h1WindowDmaSafe(dma_state.dmaFlags, io,
+            dma_state.channels[0].curSrc, dma_state.channels[0].curDst))
+        return;
+    // Acknowledge only the pending HBlank bit. VBlank, audio and all other
+    // hardware interrupt flags remain untouched and are handled normally.
+    if (!(*(vu32*)0x04000214 & 2))
+        return;
+    *(vu32*)0x04000214 = 2;
+    u32 scan = *(vu32*)0x04000004;
+    u32 line = scan >> 16;
+    if (line < 160 && (line != 0 || (scan & 2)))
+        dma_dmaTransfer(0);
+    // Mirror the original HBlank handler's forwarded GBA-IF line filter.
+    // Guest delivery remains deferred until the existing cache caller
+    // restores its IRQ state and invokes emu_updateIrqs as before.
+    if (line < 160 || (line >= 192 && line < 260))
+        vm_emulatedIfImeIe |= vm_hwIrqMask & 2;
+}
+
+[[gnu::section(".ewram"), gnu::noinline]]
+static void h1CopyCartBlock(const void* src, void* dst, bool inBounds)
+{
+    u32 psr = arm_getCpsr();
+    const GbaDmaChannel* io = (const GbaDmaChannel*)&emu_ioRegisters[0xB0];
+    if (!inBounds || !(psr & 0x80) || (psr & 0x1F) == 0x12 ||
+        !h1WindowDmaSafe(dma_state.dmaFlags, io,
+            dma_state.channels[0].curSrc, dma_state.channels[0].curDst))
+    {
+        mem_copy32(src, dst, SDC_BLOCK_SIZE);
+        return;
+    }
+    h1PollWindowDma();
+    for (u32 off = 0; off < SDC_BLOCK_SIZE; off += 32)
+    {
+        mem_copy32((const u8*)src + off, (u8*)dst + off, 32);
+        h1PollWindowDma();
+    }
+}
+
 /// @brief Loads a rom block to the given buffer.
 /// @param romBlock Rom block index to load.
 /// @param dst The destination buffer.
@@ -195,6 +275,7 @@ static void* loadRomBlock(u32 romBlock, u32 cacheBlock)
     void* currentCacheBlock = sdc_romBlockToCacheBlock[romBlock];
     if (currentCacheBlock)
     {
+        perfScreenSlowHit();
         sCacheBlockUsed[((u32)currentCacheBlock - (u32)sdc_cache) / SDC_BLOCK_SIZE] = 1;
         arm_restoreIrqs(irqs);
         return currentCacheBlock;
@@ -224,6 +305,7 @@ static void* loadRomBlock(u32 romBlock, u32 cacheBlock)
         }
     }
     u32 oldRomBlock = sCacheBlockToRomBlock[cacheBlock];
+    perfScreenVictim(romBlock, oldRomBlock);
     if (oldRomBlock != SDC_ROM_BLOCK_INVALID)
     {
         sdc_romBlockToCacheBlock[oldRomBlock] = NULL;
@@ -234,6 +316,7 @@ static void* loadRomBlock(u32 romBlock, u32 cacheBlock)
     FsWaitToken waitToken;
     if (sector != 0)
     {
+        sCurrentFetch.waitToken = &waitToken;
         slot2DiagTrace(romBlock, gSlot2Active ? SLOT2DIAG_SRC_PRE : SLOT2DIAG_SRC_SD,
             SLOT2DIAG_STATE_START);
         fs_readCacheAlignedSectorsAsync(
@@ -254,7 +337,10 @@ static void* loadRomBlock(u32 romBlock, u32 cacheBlock)
     arm_restoreIrqs(irqs);
     if (sector != 0)
     {
+        u32 perfScope = perfScreenEnterScope(2);
         irqs = fs_waitForCompletion(&waitToken, true);
+        perfScreenLeaveScope(perfScope);
+        if (waitToken.readResult != FS_READ_OK) x1Stop(X1_SD_READ_FAILED);
         slot2DiagTrace(romBlock, gSlot2Active ? SLOT2DIAG_SRC_PRE : SLOT2DIAG_SRC_SD,
             SLOT2DIAG_STATE_DONE);
     }
@@ -267,7 +353,7 @@ static void* loadRomBlock(u32 romBlock, u32 cacheBlock)
         bool diagOob = romBlock * SDC_BLOCK_SIZE >= gSlot2RomSize;
         slot2DiagTrace(romBlock, diagOob ? SLOT2DIAG_SRC_OOB : SLOT2DIAG_SRC_CART,
             SLOT2DIAG_STATE_START);
-        mem_copy32((void*)(0x08000000 + (romBlock * SDC_BLOCK_SIZE)), &sdc_cache[cacheBlock][0], SDC_BLOCK_SIZE);
+        h1CopyCartBlock((void*)(0x08000000 + (romBlock * SDC_BLOCK_SIZE)), &sdc_cache[cacheBlock][0], !diagOob);
         if (diagOob)
         {
             // Beyond the physical cart size: emulate GBA out-of-bounds reads
@@ -367,6 +453,7 @@ void sdc_init(void)
     sCurrentFetch.cacheBlock = SDC_BLOCK_INVALID;
     sCurrentFetch.romBlock = SDC_ROM_BLOCK_INVALID;
     gSdCacheIrqForbiddenRomBlockReplacementRange = 0;
+    sCurrentFetch.waitToken = NULL;
     sTabuLevel = 0;
     sTabuBlocks[0] = SDC_BLOCK_INVALID;
     sTabuBlocks[1] = SDC_BLOCK_INVALID;

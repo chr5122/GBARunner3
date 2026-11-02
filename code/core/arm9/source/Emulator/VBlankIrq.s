@@ -11,7 +11,7 @@ arm_func emu_vblankIrq
     // as a keep-alive for the slot2 .pre read path.
     ldr sp,= dtcmIrqStackEnd
     push {r0-r3,r12}
-    bl slot2DiagVblankHook
+    bl perfScreenVblankHook
     pop {r0-r3,r12}
 
     // For center and mask display capture has to be enabled every frame

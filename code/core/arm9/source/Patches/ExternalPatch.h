@@ -109,7 +109,7 @@ public:
 private:
     bool ApplyIPSPatches(u32 patchOffset, u32 patchSize, u8* targetBuf);
     bool LoadBlockIndex();
-    bool TryLoadPrepatch(u32 patchHash);
+    bool TryLoadPrepatch(u32 patchHash, const char* pathOverride = nullptr);
     bool BakePrepatch(u32 patchHash);
     bool ReadRomBlock(u32 romBlock, u8* dst);
     u32 ComputeRomSourceHash();

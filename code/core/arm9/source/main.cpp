@@ -1,4 +1,6 @@
 #include "common.h"
+#include "PerfScreen.h"
+#include "X1Readonly.h"
 #include <libtwl/mem/memVram.h>
 #include <libtwl/mem/memNtrWram.h>
 #include <libtwl/mem/memExtern.h>
@@ -84,9 +86,9 @@ static NitroEmulatorOutputStream sIsNitroOutput;
 [[gnu::section(".ewram.bss")]]
 static PlainLogger sPlainLogger { LogLevel::All, &sIsNitroOutput };
 static NullLogger sNullLogger;
-[[gnu::section(".ewram.bss"), gnu::aligned(32)]]
+[[gnu::section(".ewram.bss"), gnu::aligned(32), gnu::used]]
 static FIL sLogFile;
-[[gnu::section(".ewram.bss")]]
+[[gnu::section(".ewram.bss"), gnu::used]]
 static FileLogger sFileLogger(&sLogFile);
 ILogger* gLogger;
 static SplashScreen* sSplashScreen;
@@ -237,7 +239,11 @@ static void loadGbaCart(const char* romPath)
     // slot2 cart.
     UINT br;
     memset(&gFile, 0, sizeof(gFile));
-    f_open(&gFile, romPath, FA_OPEN_EXISTING | FA_READ);
+    bool sdRomOpen = f_open(&gFile, romPath, FA_OPEN_EXISTING | FA_READ) == FR_OK;
+    if (!sdRomOpen) {
+        memset(&gFile, 0, sizeof(gFile));
+        gFile.obj.fs = &gFatFs;
+    }
     sdc_init();
 
     // SLOT2 should be accessible now, so copy the first 2MB to Main Memory.
@@ -245,10 +251,12 @@ static void loadGbaCart(const char* romPath)
     // Verify the cart copy: the gamecode at 0xAC must match the cart header.
     u32 sd2m = 0, sd4m = 0;
     UINT rr;
-    f_lseek(&gFile, 0x200000);
-    f_read(&gFile, &sd2m, 4, &rr);
-    f_lseek(&gFile, 0x400000);
-    f_read(&gFile, &sd4m, 4, &rr);
+    if (sdRomOpen) {
+        f_lseek(&gFile, 0x200000);
+        f_read(&gFile, &sd2m, 4, &rr);
+        f_lseek(&gFile, 0x400000);
+        f_read(&gFile, &sd4m, 4, &rr);
+    }
     gLogger->Log(LogLevel::Debug, "cartcopy %08X %08X sz%u h%02X sd2M%08X ca2M%08X sd4M%08X ca4M%08X\n",
         gRomHeader.gameCode, *(u32*)(ROM_LINEAR_DS_ADDRESS + 0xAC), gSlot2RomSize,
         ((const u8*)0x08000000)[0x80],
@@ -259,7 +267,7 @@ static void loadGbaCart(const char* romPath)
     // patches are baked into the .pre sidecar (original blocks read from the
     // cart), and the linear region is patched in memory here.
     gExternalPatch.SetRomSize(gSlot2RomSize);
-    if (gExternalPatch.TryLoad(gRomHeader))
+    if (!gExternalPatch.TryLoad(gRomHeader)) x1Stop(X1_BAD_PATCH);
     {
         gLogger->Log(LogLevel::Debug, "Applying external patches to linear rom...\n");
         if (!gExternalPatch.ApplyLinearPatches())
@@ -267,8 +275,7 @@ static void loadGbaCart(const char* romPath)
             gLogger->Log(LogLevel::Fatal, "Failed to apply external patches (%u blocks), refusing to boot\n",
                 gExternalPatch.GetFailedBlockCount());
             // Fail closed: never run a game with partially applied patches.
-            GFX_PLTT_BG_MAIN[0] = 0x1F << 10;
-            while (true);
+            x1Stop(X1_APPLY_FAILED);
         }
     }
     gLogger->Log(LogLevel::Debug, "slot2diag boot size=%u patchBlocks=%u\n",
@@ -311,8 +318,7 @@ static void handleSave(const char* savePath)
     slot2LogFlush();
     if (g_useSlot2Save && !slot2CartridgeGameCodeMatches())
     {
-        gLogger->Log(LogLevel::Debug, "Slot2 save disabled: cartridge game code mismatch\n");
-        g_useSlot2Save = false;
+        x1Stop(X1_SD_SAVE_FALLBACK); // refuse before any SD save file is opened
     }
     if (gameSettings.saveType == GbaSaveType::None)
     {
@@ -569,18 +575,7 @@ extern "C" void gbaRunnerMain(int argc, char* argv[])
         while (1);
     }
 
-    // Real-hardware boot log: always write to /_gba/gbarunner3.log (truncated
-    // each boot) so patch/bake problems can be diagnosed on the device. The
-    // isNitro emulator has its own debug output and is skipped here.
-    if (gLogger == &sNullLogger)
-    {
-        f_mkdir("/_gba"); // ok if it already exists
-        if (sFileLogger.Open("/_gba/gbarunner3.log"))
-        {
-            gLogger = &sFileLogger;
-            gLogger->Log(LogLevel::Debug, "=== GBARunner3 boot log ===\n");
-        }
-    }
+    // X1: retain NullLogger; no mkdir, create/truncate, or file logger open.
 
     // if (Environment::SupportsAgbSemihosting())
         // mountAgbSemihosting();
@@ -602,9 +597,9 @@ extern "C" void gbaRunnerMain(int argc, char* argv[])
     }
     else
     {
-        gSlot2Active = false;
-        loadGbaRom(romPath);
+        x1Stop(X1_NO_CART);
     }
+    d2SealRuntime(); // no SD writes from here through retail-save/gameplay
     char* romExtension = strrchr(romPath, '.');
     if (romExtension)
     {
@@ -615,6 +610,7 @@ extern "C" void gbaRunnerMain(int argc, char* argv[])
     }
     loadGameSpecificSettings();
     handleSave(romPath);
+    if (!g_useSlot2Save) x1Stop(X1_SD_SAVE_FALLBACK);
     SelfModifyingPatches().ApplyPatches(gAppSettingsService.GetAppSettings().runSettings);
 
     waitSplashScreenAnimation();
@@ -651,6 +647,7 @@ extern "C" void gbaRunnerMain(int argc, char* argv[])
     setupArm9Clock();
 
     hic_initialize();
+    perfScreenInit();
     vm_nestedIrqLevel = 0;  // restore nested irq level
     rtos_setIrqMask(RTOS_IRQ_VBLANK);
     rtos_ackIrqMask(~0u);
