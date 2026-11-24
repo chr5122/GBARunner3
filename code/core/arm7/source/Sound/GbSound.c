@@ -120,6 +120,14 @@ static int sChannel3CurPlayBank;
 static bool sChannel3IsEnabled;
 [[gnu::aligned(4)]]
 static s8 sChannel3WaveData[2][32];
+// The game's 4-bit samples are kept unmodified so the PCM8 buffer that the DS
+// channels play can be re-encoded when NR32 changes without the game having to
+// rewrite the wave RAM. sChannel3Nr32Level is the gain the game selected,
+// sChannel3EncodedLevel the gain the buffer currently holds (1..4, 0 = mute).
+[[gnu::aligned(4)]]
+static u8 sChannel3RawWave[2][32];
+static u8 sChannel3Nr32Level = 1;
+static u8 sChannel3EncodedLevel = 1;
 
 static int sChannel4Div;
 static bool sChannel4Is7Bit;
@@ -189,6 +197,37 @@ static u16 calculateChannel4Timer(void)
     int div = sChannel4Div == 0 ? 4 : (sChannel4Div * 8);
     div <<= sChannel4ShiftFreq + 1;
     return div > 16384 ? 0 : (-4 * div);
+}
+
+// PCM8 encodings of the 4-bit wave samples for every NR32 gain. Row 0 is mute,
+// rows 1-4 are 100%, 50%, 25% and 75%. The GBA attenuates the sample itself, so
+// at 50% only 8 and at 25% only 4 levels remain; pre-scaling here reproduces
+// that exactly while the DS channel keeps its original volume and shift.
+static const s8 kWaveLevelTable[5][16] =
+{
+    { 120, 104, 88, 72, 56, 40, 24, 8, -8, -24, -40, -56, -72, -88, -104, -120 },
+    { 120, 104, 88, 72, 56, 40, 24, 8, -8, -24, -40, -56, -72, -88, -104, -120 },
+    { 112, 112, 80, 80, 48, 48, 16, 16, -16, -16, -48, -48, -80, -80, -112, -112 },
+    { 96, 96, 96, 96, 32, 32, 32, 32, -32, -32, -32, -32, -96, -96, -96, -96 },
+    { 112, 112, 91, 69, 48, 48, 27, 5, -16, -16, -37, -59, -80, -80, -101, -123 },
+};
+
+static void encodeChannel3Wave(int level)
+{
+    const s8* table = kWaveLevelTable[level];
+    for (int bank = 0; bank < 2; ++bank)
+        for (int i = 0; i < 32; ++i)
+            sChannel3WaveData[bank][i] = table[sChannel3RawWave[bank][i]];
+}
+
+// Re-encodes the play buffer for the selected gain. The DS FIFO keeps playing
+// the samples it already fetched, so the change is audible one buffer later.
+static void applyChannel3Level(int level)
+{
+    if (!level || level == sChannel3EncodedLevel)
+        return;
+    sChannel3EncodedLevel = level;
+    encodeChannel3Wave(level);
 }
 
 static void updateChannelFreq(int channel)
@@ -388,6 +427,9 @@ static void startChannel(int channel)
             snd_stopChannel(GB_CHANNEL_3_HW_R_0);
             snd_stopChannel(GB_CHANNEL_3_HW_L_1);
             snd_stopChannel(GB_CHANNEL_3_HW_R_1);
+            // A trigger may follow a mute or a gain change, so make sure the
+            // buffer matches the gain that is about to be applied.
+            applyChannel3Level(sChannel3Nr32Level);
             if (sChannel3IsMode64)
             {
                 REG_SOUNDxSAD(GB_CHANNEL_3_HW_L_0) = (u32)&sChannel3WaveData[0][0];
@@ -720,6 +762,9 @@ void gbs_init(void)
     sChannel3CurPlayBank = 0;
     sChannel3IsEnabled = false;
     memset(sChannel3WaveData, 0, sizeof(sChannel3WaveData));
+    memset(sChannel3RawWave, 0, sizeof(sChannel3RawWave));
+    sChannel3Nr32Level = 1;
+    sChannel3EncodedLevel = 1;
 
     sChannel4Div = 0;
     sChannel4Is7Bit = false;
@@ -843,6 +888,13 @@ void gbs_writeReg(u32 reg, u8 val)
             sChannelLengthCounter[2] = 256 - val;
             break;
         case 0x73: //NR32
+        {
+            // Desktop harness anchor: the PSG3 register trace hooks this
+            // address to record (reg, value) pairs at the moment of the write.
+            __asm__ volatile(".global gbs_nr32Entry\ngbs_nr32Entry:");
+            const u8 oldLevel = sChannel3Nr32Level;
+            const int level = (val & 0x80) ? 4 : ((val >> 5) & 3);
+            sChannel3Nr32Level = level;
             if (val & 0x80)
                 sChannelVolume[2] = 12; //75%
             else
@@ -857,8 +909,15 @@ void gbs_writeReg(u32 reg, u8 val)
                 else
                     sChannelVolume[2] = 4;
             }
+            // A19: a change between two audible gains while the channel plays
+            // needs the buffer rebuilt. A20: the same is true when the gain
+            // comes back from mute while the channel is still running.
+            if (level && level != sChannel3EncodedLevel &&
+                (oldLevel || (sChannelPlaying & (1 << 2))))
+                applyChannel3Level(level);
             updateChannelVolume(2);
             break;
+        }
         case 0x74: //NR33
             sChannelFreq[2] = (sChannelFreq[2] & 0x700) | val;
             updateChannelFreq(2);
@@ -960,8 +1019,15 @@ void gbs_writeReg(u32 reg, u8 val)
         case 0x9D:
         case 0x9E:
         case 0x9F:
-            sChannel3WaveData[1 - sChannel3CurPlayBank][(reg & 0xF) << 1] = 120 - (val & 0xF0);
-            sChannel3WaveData[1 - sChannel3CurPlayBank][((reg & 0xF) << 1) + 1] = 120 - ((val & 0xF) << 4);
+        {
+            int bank = 1 - sChannel3CurPlayBank;
+            int offset = (reg & 0xF) << 1;
+            const s8* table = kWaveLevelTable[sChannel3EncodedLevel];
+            sChannel3RawWave[bank][offset] = val >> 4;
+            sChannel3RawWave[bank][offset + 1] = val & 0xF;
+            sChannel3WaveData[bank][offset] = table[sChannel3RawWave[bank][offset]];
+            sChannel3WaveData[bank][offset + 1] = table[sChannel3RawWave[bank][offset + 1]];
             break;
+        }
     }
 }
